@@ -1,3 +1,9 @@
+use ndarray::s;
+use ndarray::Array1;
+use ndarray::Array2;
+use ndarray::Array3;
+use ndarray::ArrayView1;
+use ndarray::ArrayViewMut1;
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::error::Error;
@@ -19,6 +25,23 @@ struct Config {
 
 #[derive(Debug, Clone)]
 struct TransformerWeights {
+    token_embedding_table: Array2<f32>, // (vocab_size, dim)
+    rms_att_weight: Array2<f32>,        // (layer, dim) rmsnorm weights
+    rms_ffn_weight: Array2<f32>,        // (layer, dim)
+    wq: Array3<f32>,                    // (layer, dim, dim)
+    wk: Array3<f32>,                    // (layer, dim, dim)
+    wv: Array3<f32>,                    // (layer, dim, dim)
+    wo: Array3<f32>,                    // (layer, dim, dim)
+    w1: Array3<f32>,                    // (layer, hidden_dim, dim)
+    w2: Array3<f32>,                    // (layer, dim, hidden_dim)
+    w3: Array3<f32>,                    // (layer, hidden_dim, dim)
+    rms_final_weight: Array1<f32>,      // (dim,)
+    freq_cis_real: Array2<f32>,         // (seq_len, dim/2)
+    freq_cis_imag: Array2<f32>,         // (seq_len, dim/2)
+}
+
+#[derive(Debug, Clone)]
+struct TransformerWeightsOld {
     token_embedding_table: Vec<f32>, // (vocab_size, dim)
     rms_att_weight: Vec<f32>,        // (layer, dim) rmsnorm weights
     rms_ffn_weight: Vec<f32>,        // (layer, dim)
@@ -36,7 +59,7 @@ struct TransformerWeights {
 
 impl TransformerWeights {
     fn try_new(config: &Config, file: &mut File) -> Result<Self, Box<dyn Error>> {
-        let mut weights = Self {
+        let mut weights = TransformerWeightsOld {
             token_embedding_table: vec![0.0; (config.vocab_size * config.dim) as usize],
             rms_att_weight: vec![0.0; (config.n_layers * config.dim) as usize],
             rms_ffn_weight: vec![0.0; (config.n_layers * config.dim) as usize],
@@ -145,69 +168,102 @@ impl TransformerWeights {
         })
         .unwrap();
 
-        Ok(weights)
+        let n_layers = config.n_layers as usize;
+        let dim = config.dim as usize;
+        let hidden_dim = config.hidden_dim as usize;
+        let seq_len = config.seq_len as usize;
+        let vocab_size = config.vocab_size as usize;
+
+        let token_embedding_table =
+            Array2::from_shape_vec((vocab_size, dim), weights.token_embedding_table)?;
+        let rms_att_weight = Array2::from_shape_vec((n_layers, dim), weights.rms_att_weight)?;
+        let rms_ffn_weight = Array2::from_shape_vec((n_layers, dim), weights.rms_ffn_weight)?;
+        let wq = Array3::from_shape_vec((n_layers, dim, dim), weights.wq)?;
+        let wk = Array3::from_shape_vec((n_layers, dim, dim), weights.wk)?;
+        let wv = Array3::from_shape_vec((n_layers, dim, dim), weights.wv)?;
+        let wo = Array3::from_shape_vec((n_layers, dim, dim), weights.wo)?;
+        let w1 = Array3::from_shape_vec((n_layers, hidden_dim, dim), weights.w1)?;
+        let w2 = Array3::from_shape_vec((n_layers, dim, hidden_dim), weights.w2)?;
+        let w3 = Array3::from_shape_vec((n_layers, hidden_dim, dim), weights.w3)?;
+        let rms_final_weight = Array1::from_shape_vec((dim,), weights.rms_final_weight)?;
+        let freq_cis_real = Array2::from_shape_vec((seq_len, dim / 2), weights.freq_cis_real)?;
+        let freq_cis_imag = Array2::from_shape_vec((seq_len, dim / 2), weights.freq_cis_imag)?;
+
+        let weights_arr = Self {
+            token_embedding_table,
+            rms_att_weight,
+            rms_ffn_weight,
+            wq,
+            wk,
+            wv,
+            wo,
+            w1,
+            w2,
+            w3,
+            rms_final_weight,
+            freq_cis_real,
+            freq_cis_imag,
+        };
+
+        Ok(weights_arr)
     }
 }
 
 #[derive(Debug, Clone)]
 struct RunState {
-    x: Vec<f32>,           // activation at current time stamp (dim,)
-    xb: Vec<f32>,          // same, but inside a residual branch (dim,)
-    xb2: Vec<f32>,         // an additional buffer just for convenience (dim,)
-    hb: Vec<f32>,          // buffer for hidden dimension in the ffn (hidden_dim,)
-    hb2: Vec<f32>,         // buffer for hidden dimension in the ffn (hidden_dim,)
-    q: Vec<f32>,           // query (dim,)
-    k: Vec<f32>,           // key (dim,)
-    v: Vec<f32>,           // value (dim,)
-    att: Vec<f32>,         // buffer for scores/attention values (seq_len,)
-    logits: Vec<f32>,      // output logits
-    key_cache: Vec<f32>,   // (layer, seq_len, dim)
-    value_cache: Vec<f32>, // (layer, seq_len, dim)
+    x: Array1<f32>,           // activation at current time stamp (dim,)
+    xb: Array1<f32>,          // same, but inside a residual branch (dim,)
+    xb2: Array1<f32>,         // an additional buffer just for convenience (dim,)
+    hb: Array1<f32>,          // buffer for hidden dimension in the ffn (hidden_dim,)
+    hb2: Array1<f32>,         // buffer for hidden dimension in the ffn (hidden_dim,)
+    q: Array1<f32>,           // query (dim,)
+    k: Array1<f32>,           // key (dim,)
+    v: Array1<f32>,           // value (dim,)
+    att: Array1<f32>,         // buffer for scores/attention values (seq_len,)
+    logits: Array1<f32>,      // output logits
+    key_cache: Array3<f32>,   // (layer, seq_len, dim)
+    value_cache: Array3<f32>, // (layer, seq_len, dim)
 }
 
 impl RunState {
     fn new(config: &Config) -> RunState {
         RunState {
-            x: vec![0.0; config.dim as usize],
-            xb: vec![0.0; config.dim as usize],
-            xb2: vec![0.0; config.dim as usize],
-            hb: vec![0.0; config.hidden_dim as usize],
-            hb2: vec![0.0; config.hidden_dim as usize],
-            q: vec![0.0; config.dim as usize],
-            k: vec![0.0; config.dim as usize],
-            v: vec![0.0; config.dim as usize],
-            att: vec![0.0; config.seq_len as usize],
-            logits: vec![0.0; config.vocab_size as usize],
-            key_cache: vec![0.0; (config.n_layers * config.seq_len * config.dim) as usize],
-            value_cache: vec![0.0; (config.n_layers * config.seq_len * config.dim) as usize],
+            x: Array1::zeros((config.dim as usize,)),
+            xb: Array1::zeros((config.dim as usize,)),
+            xb2: Array1::zeros((config.dim as usize,)),
+            hb: Array1::zeros((config.hidden_dim as usize,)),
+            hb2: Array1::zeros((config.hidden_dim as usize,)),
+            q: Array1::zeros((config.dim as usize,)),
+            k: Array1::zeros((config.dim as usize,)),
+            v: Array1::zeros((config.dim as usize,)),
+            att: Array1::zeros((config.seq_len as usize,)),
+            logits: Array1::zeros((config.vocab_size as usize,)),
+            key_cache: Array3::zeros((
+                config.n_layers as usize,
+                config.seq_len as usize,
+                config.dim as usize,
+            )),
+            value_cache: Array3::zeros((
+                config.n_layers as usize,
+                config.seq_len as usize,
+                config.dim as usize,
+            )),
         }
     }
 }
 
-fn accum(a: &mut [f32], b: &[f32]) {
-    for (i, val) in a.iter_mut().zip(b.iter()) {
-        *i += *val;
-    }
-}
-
-fn rmsnorm(o: &mut [f32], x: &[f32], weight: &[f32]) {
-    let size = o.len();
+fn rmsnorm(mut o: ArrayViewMut1<f32>, x: ArrayView1<f32>, weight: ArrayView1<f32>) {
     // calculate sum of squares
-    let mut ss = 0.0;
-    for &val in x {
-        ss += val * val;
-    }
-    ss /= size as f32;
+    let mut ss: f32 = x.mapv(|x| x.powi(2)).sum();
+    ss /= o.len() as f32;
     ss += 1e-5_f32;
     ss = 1.0 / ss.sqrt();
 
     // normalize and scale
-    for j in 0..o.len() {
-        o[j] = weight[j] * ss * x[j];
-    }
+    o.assign(&(ss * &x * &weight));
 }
 
-fn sample(probabilities: &[f32]) -> usize {
+fn sample(probabilities: ArrayView1<f32>) -> usize {
     // sample index from probabilities, they must sum to 1
     let r: f32 = rand::random();
     let mut cdf = 0.0;
@@ -220,8 +276,7 @@ fn sample(probabilities: &[f32]) -> usize {
     probabilities.len() - 1 // in case of rounding errors
 }
 
-fn softmax(x: &mut [f32]) {
-    // let size = size.unwrap_or(x.len());
+fn softmax(mut x: ArrayViewMut1<f32>) {
     if x.len() == 1 {
         x[0] = 1.0;
         return;
@@ -229,7 +284,7 @@ fn softmax(x: &mut [f32]) {
 
     // find max value (for numerical stability)
     let mut max_val = x[0];
-    for &val in &x[1..] {
+    for &val in x.slice(s![1..]) {
         if val > max_val {
             max_val = val;
         }
@@ -241,26 +296,10 @@ fn softmax(x: &mut [f32]) {
     }
 
     // normalize
-    let mut sum = 0.0;
-    for &val in x.iter() {
-        sum += val;
-    }
-    for val in x.iter_mut() {
-        *val /= sum;
-    }
+    x /= x.sum();
 }
 
-fn matmul(xout: &mut [f32], x: &[f32], w: &[f32], n: usize, d: usize) {
-    // W (d,n) @ x (n,) -> xout (d,)
-    for i in 0..d {
-        let mut val = 0.0;
-        for j in 0..n {
-            val += w[i * n + j] * x[j];
-        }
-        xout[i] = val;
-    }
-}
-
+// Matmuls are W (d,n) @ x (n,) -> xout (d,)
 fn transformer(
     token: usize,
     pos: usize,
@@ -270,54 +309,42 @@ fn transformer(
 ) {
     // a few convenience variables
     let dim = config.dim as usize;
-    let hidden_dim = config.hidden_dim as usize;
     let head_size = (dim / config.n_heads as usize) as usize;
 
     // copy the token embedding into x
-    let content_row = &weights.token_embedding_table[token * dim..(token + 1) * dim];
-    state.x.copy_from_slice(content_row);
+    state
+        .x
+        .assign(&weights.token_embedding_table.slice(s![token, ..]));
 
     // pluck out the "pos" row of freq_cis_real and freq_cis_imag
-    let freq_cis_real_row = &weights.freq_cis_real[pos * head_size / 2..(pos + 1) * head_size / 2];
-    let freq_cis_imag_row = &weights.freq_cis_imag[pos * head_size / 2..(pos + 1) * head_size / 2];
+    let freq_cis_real_row = weights.freq_cis_real.slice(s![pos, ..head_size / 2]);
+    let freq_cis_imag_row = weights.freq_cis_imag.slice(s![pos, ..head_size / 2]);
 
     // forward all the layers
     for l in 0..config.n_layers as usize {
         // attention rmsnorm
         rmsnorm(
-            &mut state.xb,
-            &state.x,
-            &weights.rms_att_weight[l * dim..(l + 1) * dim],
+            (&mut state.xb).into(),
+            (&state.x).into(),
+            weights.rms_att_weight.slice(s![l, ..]),
         );
 
         // qkv matmuls for this position
-        matmul(
-            &mut state.q,
-            &state.xb,
-            &weights.wq[l * dim * dim..(l + 1) * dim * dim],
-            dim,
-            dim,
-        );
-        matmul(
-            &mut state.k,
-            &state.xb,
-            &weights.wk[l * dim * dim..(l + 1) * dim * dim],
-            dim,
-            dim,
-        );
-        matmul(
-            &mut state.v,
-            &state.xb,
-            &weights.wv[l * dim * dim..(l + 1) * dim * dim],
-            dim,
-            dim,
-        );
+        state
+            .q
+            .assign(&weights.wq.slice(s![l, .., ..]).dot(&state.xb));
+        state
+            .k
+            .assign(&weights.wk.slice(s![l, .., ..]).dot(&state.xb));
+        state
+            .v
+            .assign(&weights.wv.slice(s![l, .., ..]).dot(&state.xb));
 
         // apply RoPE rotation to the q and k vectors for each head
         for h in 0..config.n_heads as usize {
             // get the q and k vectors for this head
-            let q = &mut state.q[h * head_size..(h + 1) * head_size];
-            let k = &mut state.k[h * head_size..(h + 1) * head_size];
+            let mut q = state.q.slice_mut(s![h * head_size..(h + 1) * head_size]);
+            let mut k = state.k.slice_mut(s![h * head_size..(h + 1) * head_size]);
 
             // rotate q and k by the freq_cis_real and freq_cis_imag
             for i in (0..head_size).step_by(2) {
@@ -335,81 +362,65 @@ fn transformer(
         }
 
         // save key,value at this time step (pos) to our kv cache
-        let loff = l * config.seq_len as usize * dim; // kv cache layer offset for convenience
-        let key_cache_row = &mut state.key_cache[loff + pos * dim..loff + (pos + 1) * dim];
-        let value_cache_row = &mut state.value_cache[loff + pos * dim..loff + (pos + 1) * dim];
-        key_cache_row.copy_from_slice(&state.k);
-        value_cache_row.copy_from_slice(&state.v);
+        // let loff = l * config.seq_len as usize * dim; // kv cache layer offset for convenience
+        state.key_cache.slice_mut(s![l, pos, ..]).assign(&state.k);
+        state.value_cache.slice_mut(s![l, pos, ..]).assign(&state.v);
 
         // multihead attention. iterate over all heads
         for h in 0..config.n_heads as usize {
             // get the query vector for this head
-            let q = &state.q[h * head_size..(h + 1) * head_size];
+            let q = state.q.slice(s![h * head_size..(h + 1) * head_size]);
 
             // iterate over all timesteps, including the current one
             for t in 0..=pos {
                 // get the key vector for this head and at this timestep
-                let start = loff + t * dim + h * head_size;
-                let k = &state.key_cache[start..start + head_size];
+                let k = state
+                    .key_cache
+                    .slice(s![l, t, h * head_size..(h + 1) * head_size]);
 
-                // calculate the attention score as the dot product of q and k
-                let mut score = 0.0;
-                for i in 0..head_size {
-                    score += q[i] * k[i];
-                }
-                score /= (head_size as f32).sqrt();
+                // calculate the attention score as the scaled dot product of q and k
+                let score = k.dot(&q) / (head_size as f32).sqrt();
+
                 // save the score to the attention buffer
                 state.att[t] = score;
             }
 
-            softmax(&mut state.att[..=pos]);
+            softmax(state.att.slice_mut(s![..=pos]));
 
             // weighted sum of the values, store back into xb
             for i in 0..head_size {
                 let mut val = 0.0;
                 for t in 0..=pos {
                     // note bad locality
-                    val += state.att[t] * state.value_cache[loff + t * dim + h * head_size + i];
+                    val += state.att[t] * state.value_cache[[l, t, h * head_size + i]];
                 }
                 state.xb[h * head_size + i] = val;
             }
         }
 
         // final matmul to get the output of the attention
-        matmul(
-            &mut state.xb2,
-            &state.xb,
-            &weights.wo[l * dim * dim..(l + 1) * dim * dim],
-            dim,
-            dim,
-        );
+        state
+            .xb2
+            .assign(&weights.wo.slice(s![l, .., ..]).dot(&state.xb));
 
         // residual connection back into x
-        accum(&mut state.x, &state.xb2);
+        state.x += &state.xb2;
 
         // ffn rmsnorm
         rmsnorm(
-            &mut state.xb,
-            &state.x,
-            &weights.rms_ffn_weight[l * dim..(l + 1) * dim],
+            (&mut state.xb).into(),
+            (&state.x).into(),
+            weights.rms_ffn_weight.slice(s![l, ..]),
         );
 
         // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
         // first calculate self.w1(x) and self.w3(x)
-        matmul(
-            &mut state.hb,
-            &state.xb,
-            &weights.w1[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
-            dim,
-            hidden_dim,
-        );
-        matmul(
-            &mut state.hb2,
-            &state.xb,
-            &weights.w3[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
-            dim,
-            hidden_dim,
-        );
+        state
+            .hb
+            .assign(&weights.w1.slice(s![l, .., ..]).dot(&state.xb));
+        state
+            .hb2
+            .assign(&weights.w3.slice(s![l, .., ..]).dot(&state.xb));
 
         // F.silu; silu(x)=x*σ(x),where σ(x) is the logistic sigmoid
         for val in &mut state.hb {
@@ -417,38 +428,32 @@ fn transformer(
         }
 
         // elementwise multiply with w3(x)
-        for (hb, hb2) in state.hb.iter_mut().zip(&state.hb2) {
-            *hb *= *hb2;
-        }
+        state.hb *= &state.hb2;
 
         // final matmul to get the output of the ffn
-        matmul(
-            &mut state.xb,
-            &state.hb,
-            &weights.w2[l * dim * hidden_dim..(l + 1) * dim * hidden_dim],
-            hidden_dim,
-            dim,
-        );
+        state
+            .xb
+            .assign(&weights.w2.slice(s![l, .., ..]).dot(&state.hb));
 
         // residual connection
-        accum(&mut state.x, &state.xb);
+        state.x += &state.xb;
     }
 
     // final rmsnorm
     let temp_x = state.x.clone();
-    rmsnorm(&mut state.x, &temp_x, &weights.rms_final_weight);
+    rmsnorm(
+        (&mut state.x).into(),
+        (&temp_x).into(),
+        (&weights.rms_final_weight).into(),
+    );
 
     // classifier into logits
-    matmul(
-        &mut state.logits,
-        &state.x,
-        &weights.token_embedding_table,
-        dim,
-        config.vocab_size as usize,
-    );
+    state
+        .logits
+        .assign(&weights.token_embedding_table.dot(&state.x));
 }
 
-fn argmax(v: &[f32]) -> usize {
+fn argmax(v: ArrayView1<f32>) -> usize {
     let mut max_i = 0;
     let mut max_p = v[0];
     for (i, &val) in v.iter().enumerate().skip(1) {
@@ -483,7 +488,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         // advance
         token = if temperature == 0.0_f32 {
             // greedy argmax sampling
-            argmax(&state.logits)
+            argmax((&state.logits).into())
         } else {
             // apply the temperature to the logits
             for q in 0..config.vocab_size as usize {
@@ -491,10 +496,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
 
             // apply softmax to the logits to get the probabilities for next token
-            softmax(&mut state.logits);
+            softmax((&mut state.logits).into());
 
             // we now want to sample from this distribution to get the next token
-            sample(&state.logits)
+            sample((&state.logits).into())
         };
 
         println!("{token}");
